@@ -1,21 +1,44 @@
 import { IMessageSDK } from '@photon-ai/imessage-kit'
+import type { Message } from '@photon-ai/imessage-kit'
 import { config } from './config.js'
 import { MessageQueue } from './queue.js'
 import { ContextManager } from './context.js'
 import { handleMessage } from './router.js'
 import { initDB, getDB, getMemoryCount, getPendingFailedMessages, incrementFailedRetry, deleteFailedMessage } from './memory/db.js'
 import { warmupEmbeddings, getEmbedding } from './memory/embeddings.js'
+import { storeMemory } from './handlers/store.js'
+import { analyzeImage } from './handlers/image.js'
+import { transcribeAudio, isAudioFile } from './handlers/voice.js'
 import { setupScheduler } from './scheduler.js'
 import { driftLogger } from './plugins/drift-logger.js'
 import { RateLimitError } from './retry.js'
 
-// Per-sender debounce state
+// ─── Per-sender debounce batching ────────────────────────────────────────────
 interface Batch {
   messages: string[]
   timer: ReturnType<typeof setTimeout>
 }
 const pendingBatches = new Map<string, Batch>()
 
+// ─── Onboarding ───────────────────────────────────────────────────────────────
+const ONBOARDING_MSG = `hey! i'm drift — your personal memory companion 🌊
+
+just text me what's happening in your life and i'll remember it all. ask me anything later and i'll dig it up.
+
+you can also:
+• "remind me to [x] on [day]" — i'll ping you
+• "what did i say about [x]?" — search your memories
+• "research: [topic]" — deep dive with a full report
+• "who is [name]?" — profile of anyone you've mentioned
+• "my weekly review" — Sunday reflection
+• "habits" — track your streaks
+• "stats" — see your memory count
+• send a photo — i'll analyze it
+• send a voice memo — i'll transcribe it
+
+let's go — what's on your mind?`
+
+// ─── Startup: retry failed messages ──────────────────────────────────────────
 async function retryFailedMessages(): Promise<void> {
   const failed = getPendingFailedMessages(3)
   if (failed.length === 0) return
@@ -27,10 +50,7 @@ async function retryFailedMessages(): Promise<void> {
     try {
       const embedding = await getEmbedding(msg.raw_text)
       getDB()
-        .prepare(
-          `INSERT INTO memories (raw_text, embedding, sender, tags, sentiment)
-           VALUES (?, ?, ?, ?, 0)`
-        )
+        .prepare(`INSERT INTO memories (raw_text, embedding, sender, tags, sentiment) VALUES (?, ?, ?, ?, 0)`)
         .run(msg.raw_text, Buffer.from(embedding.buffer), msg.sender, null)
       deleteFailedMessage(msg.id)
       recovered++
@@ -43,80 +63,116 @@ async function retryFailedMessages(): Promise<void> {
   if (recovered > 0) console.log(`✓ Recovered ${recovered} failed message(s)`)
 }
 
-const ONBOARDING_MSG = `hey! i'm drift — your personal memory companion 🌊
-
-just text me what's happening in your life and i'll remember it all. ask me anything later and i'll dig it up.
-
-you can also:
-• "remind me to [x] on [day]" — i'll ping you
-• "what did i say about [x]?" — search your memories
-• "my weekly review" — Sunday reflection
-• "stats" — see your memory count
-• "search [anything]" — web search, personalized to you
-
-let's go — what's on your mind?`
-
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('🌊 Drift starting up...')
   console.log(`   Phone:    ${config.myNumber}`)
   console.log(`   Senders:  ${[...config.allowedSenders].join(', ')}`)
   console.log(`   Calendar: ${config.calendarEnabled ? '✓ connected' : '✗ not configured'}`)
   console.log(`   Search:   ${config.searchEnabled ? '✓ enabled' : '✗ no API key'}`)
+  console.log(`   Voice:    ${config.voiceEnabled ? '✓ enabled' : '✗ no OpenAI key'}`)
   console.log(`   Debounce: ${config.debounceMs > 0 ? `${config.debounceMs / 1000}s` : 'disabled'}`)
   console.log(`   Debug:    ${config.debug}`)
   console.log()
 
-  // Initialize database
   const db = initDB()
   console.log('✓ Database ready (WAL mode)')
 
-  // Warm up embedding model — avoids cold-start delay on first message
   await warmupEmbeddings()
-
-  // Retry any messages that failed to embed on a previous run
   await retryFailedMessages()
 
-  // Initialize SDK
   const plugins = config.debug ? [driftLogger] : []
   const sdk = new IMessageSDK({
     debug: config.debug,
-    watcher: {
-      pollInterval: 2000,
-      excludeOwnMessages: true,
-    },
+    watcher: { pollInterval: 2000, excludeOwnMessages: true },
     plugins,
   })
   console.log('✓ SDK initialized')
 
-  // Restore per-sender conversation contexts
   const contextManager = ContextManager.restore()
   console.log(`✓ Contexts restored (${contextManager.size} senders)`)
 
-  // Sequential message queue — prevents race conditions
   const queue = new MessageQueue()
 
-  // ─── Message Handler ─────────────────────────────────────────────────────
-  async function processMessage(text: string, sender: string): Promise<void> {
+  // ─── Core message processor ───────────────────────────────────────────────
+  async function processMessage(msg: Message): Promise<void> {
+    const sender = msg.sender
     const context = contextManager.get(sender)
+    const text = msg.text?.trim() ?? ''
 
-    // First message from this sender — send onboarding
+    // First-ever message → send onboarding
     const isFirstMessage = getMemoryCount(sender) === 0 && context.length === 0
     if (isFirstMessage) {
       await sdk.send(sender, ONBOARDING_MSG)
-      // Still process their actual message after the intro
     }
 
+    // ── Image attachments ───────────────────────────────────────────────────
+    const imageAttachments = msg.attachments.filter((a) => a.isImage)
+    if (imageAttachments.length > 0) {
+      const imagePaths = imageAttachments.map((a) => a.path)
+      const result = await analyzeImage(imagePaths, text, context)
+
+      if (result.memoryText) {
+        // Store image analysis as a memory silently
+        context.add('user', result.memoryText)
+        await storeMemory(result.memoryText, sender, context)
+      }
+
+      context.add('assistant', result.reply)
+      await sdk.send(sender, result.reply)
+      return
+    }
+
+    // ── Audio attachments (voice memos) ─────────────────────────────────────
+    const audioAttachments = msg.attachments.filter(
+      (a) => isAudioFile(a.mimeType, a.filename)
+    )
+    if (audioAttachments.length > 0) {
+      const audioPath = audioAttachments[0]!.path
+      const transcript = await transcribeAudio(audioPath)
+
+      if (transcript === '__NO_FFMPEG__') {
+        await sdk.send(sender, "got a voice memo but need ffmpeg to transcribe it — run `brew install ffmpeg` then restart drift")
+        return
+      }
+
+      if (!transcript) {
+        await sdk.send(sender, "got the voice memo but couldn't transcribe it — try again?")
+        return
+      }
+
+      // Treat transcript as regular text message
+      await sdk.send(sender, `🎙️ transcribed: "${transcript.slice(0, 80)}${transcript.length > 80 ? '...' : ''}"`)
+      context.add('user', transcript)
+
+      let reply: string
+      try {
+        reply = await handleMessage(transcript, sender, context, sdk)
+      } catch (e) {
+        reply = e instanceof RateLimitError
+          ? "brain's a bit overloaded right now, try again in a sec"
+          : "something went wrong processing that"
+      }
+
+      context.add('assistant', reply)
+      await sdk.send(sender, reply)
+      return
+    }
+
+    // ── Text message ─────────────────────────────────────────────────────────
+    if (!text) return
+
     context.add('user', text)
+
     let reply: string
     try {
       reply = await handleMessage(text, sender, context, sdk)
     } catch (e) {
-      if (e instanceof RateLimitError) {
-        reply = "brain's a bit overloaded right now, try again in a sec"
-      } else {
-        throw e
-      }
+      reply = e instanceof RateLimitError
+        ? "brain's a bit overloaded right now, try again in a sec"
+        : "something went wrong, try again"
     }
+
     context.add('assistant', reply)
     await sdk.send(sender, reply)
   }
@@ -131,10 +187,18 @@ async function main() {
         return
       }
 
+      const hasAttachments = msg.attachments.length > 0
       const text = msg.text?.trim() ?? ''
+
+      // Attachments bypass debounce — process immediately
+      if (hasAttachments) {
+        queue.enqueue(() => processMessage(msg))
+        return
+      }
+
       if (!text) return
 
-      // Debounce batching — collect rapid-fire messages into one story
+      // Debounce text messages — batch rapid-fire messages into one story
       if (config.debounceMs > 0) {
         const existing = pendingBatches.get(msg.sender)
         if (existing) {
@@ -148,37 +212,38 @@ async function main() {
         batch.timer = setTimeout(() => {
           pendingBatches.delete(msg.sender)
           const combined = batch.messages.join('\n')
-          queue.enqueue(() => processMessage(combined, msg.sender))
+          // Create a synthetic message object with the combined text
+          const syntheticMsg: Message = { ...msg, text: combined }
+          queue.enqueue(() => processMessage(syntheticMsg))
         }, config.debounceMs)
       } else {
-        queue.enqueue(() => processMessage(text, msg.sender))
+        queue.enqueue(() => processMessage(msg))
       }
     },
-    onError: (err) => {
-      console.error('[Watcher] error:', err)
-    },
+    onError: (err) => console.error('[Watcher] error:', err),
   })
   console.log('✓ Watcher started (polling every 2s)')
 
-  // ─── Scheduler ───────────────────────────────────────────────────────────
   const scheduler = setupScheduler(sdk, config.myNumber)
-  console.log('✓ Scheduler started (8:30am daily + Sunday 7pm reflection + reminders)')
+  console.log('✓ Scheduler started (8:30am briefing · Sunday reflection · reminders · mood check-in)')
 
   console.log()
   console.log('🌊 Drift is live — text something!')
   console.log('   Press Ctrl+C to stop.')
   console.log()
 
-  // ─── Graceful Shutdown ───────────────────────────────────────────────────
+  // ─── Graceful shutdown ────────────────────────────────────────────────────
   async function shutdown() {
     console.log('\n🌊 Drift shutting down...')
 
-    // Clear any pending debounce timers — process them immediately
+    // Flush pending debounce batches
     for (const [sender, batch] of pendingBatches) {
       clearTimeout(batch.timer)
       if (batch.messages.length > 0) {
         const combined = batch.messages.join('\n')
-        await processMessage(combined, sender).catch(() => {})
+        const context = contextManager.get(sender)
+        context.add('user', combined)
+        await storeMemory(combined, sender, context).catch(() => {})
       }
     }
 
@@ -191,9 +256,7 @@ async function main() {
     try {
       db.pragma('wal_checkpoint(FULL)')
       console.log('   ✓ Database checkpointed')
-    } catch {
-      /* already closed */
-    }
+    } catch { /* already closed */ }
 
     sdk.stopWatching()
     await sdk.close()

@@ -36,6 +36,9 @@ export const config = {
   // Brave Search — optional
   braveApiKey: optionalEnv('BRAVE_API_KEY'),
 
+  // OpenAI — optional, used for Whisper voice transcription
+  openaiApiKey: optionalEnv('OPENAI_API_KEY'),
+
   // Google Calendar — optional
   google: {
     clientId: optionalEnv('GOOGLE_CLIENT_ID'),
@@ -50,5 +53,9 @@ export const config = {
 
   get searchEnabled(): boolean {
     return !!this.braveApiKey
+  },
+
+  get voiceEnabled(): boolean {
+    return !!this.openaiApiKey
   },
 } as const

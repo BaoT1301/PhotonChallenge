@@ -10,32 +10,29 @@ import { webSearch } from './handlers/search.js'
 import { forgetLast } from './handlers/forget.js'
 import { getStats } from './handlers/stats.js'
 import { exportMemories } from './handlers/export.js'
+import { researchTopic } from './handlers/research.js'
+import { getPeopleProfile } from './handlers/people.js'
+import { getHabitsOverview } from './handlers/habits.js'
+import { extractUrls, summarizeLink } from './handlers/link.js'
 import { withRetry } from './retry.js'
 import { config } from './config.js'
 
 const client = new Anthropic({ apiKey: config.anthropicApiKey })
 
 type Intent =
-  | 'store'
-  | 'recall'
-  | 'reflect'
-  | 'chat'
-  | 'remind'
-  | 'calendar'
-  | 'search'
-  | 'forget'
-  | 'stats'
-  | 'export'
+  | 'store' | 'recall' | 'reflect' | 'chat'
+  | 'remind' | 'calendar' | 'search' | 'research'
+  | 'forget' | 'stats' | 'export'
+  | 'people' | 'habits' | 'link'
 
-/**
- * Local regex classification — handles ~70% of messages with zero API cost.
- * Returns null for ambiguous cases that need LLM fallback.
- */
 function localClassify(text: string): Intent | null {
   const t = text.toLowerCase().trim()
 
-  // Forget / delete last memory
-  if (/^(forget that|delete that|remove that|undo|never mind that)\s*[.!]*$/.test(t)) return 'forget'
+  // Link — check first since URLs are unambiguous
+  if (/https?:\/\//.test(t)) return 'link'
+
+  // Forget
+  if (/^(forget that|delete that|remove that|undo that|never mind that)\s*[.!]*$/.test(t)) return 'forget'
 
   // Stats
   if (/^(stats|my stats|how many memories|memory count|show stats)\s*[?!.]*$/.test(t)) return 'stats'
@@ -43,44 +40,45 @@ function localClassify(text: string): Intent | null {
   // Export
   if (/^(export|export memories|download memories|send my memories|backup)\s*[?!.]*$/.test(t)) return 'export'
 
-  // Reminder — "remind me", "set a reminder", "don't let me forget"
+  // Habits
+  if (/\b(habit|habits|streak|streaks|my streak|how.*streak|gym streak|run streak)\b/.test(t)) return 'habits'
+
+  // People profiles
+  if (/\b(who is|tell me about|what do you know about|info on)\b/.test(t)) return 'people'
+
+  // Research mode — deep dive
+  if (/^(research|deep dive|research mode|deep research|investigate|look into)\s*:?\s*\S/.test(t)) return 'research'
+
+  // Reminder
   if (/\b(remind me|set a reminder|don'?t let me forget|ping me)\b/.test(t)) return 'remind'
 
-  // Calendar — "what's on my calendar", "my schedule", "when is", etc.
+  // Calendar
   if (
     /\b(calendar|schedule|what'?s? (on|happening|going on)|my day|my week|meetings?|events?)\b/.test(t) &&
     !/remember|saved|told you/.test(t)
-  )
-    return 'calendar'
+  ) return 'calendar'
 
-  // Recall — questions about the past
+  // Recall
   if (/^(what|when|where|who|how|did i|do i|have i|remind me about|tell me about)\b/.test(t)) return 'recall'
   if (/\?$/.test(t) && t.length < 150) return 'recall'
   if (/\b(remember|last time|earlier|mentioned|you said|do you know)\b/.test(t)) return 'recall'
 
-  // Reflect — summary / pattern requests
+  // Reflect
   if (/^(weekly|summary|reflect|review|digest|wrap.?up|look back|my week)\b/.test(t)) return 'reflect'
   if (/\b(how.*(my|this).*(week|month)|pattern|trend|overview|vibe check)\b/.test(t)) return 'reflect'
 
-  // Search — explicit web search / job requests
-  if (
-    /\b(search|find me|look up|google|jobs?|internships?|opportunities?|companies?|research)\b/.test(t)
-  )
-    return 'search'
+  // Search — explicit
+  if (/\b(search|find me|look up|google|jobs?|internships?|opportunities?|companies?)\b/.test(t)) return 'search'
 
-  // Chat — greetings and short acks
-  if (/^(hey|hi|hello|thanks|thank you|ok|okay|good morning|gm|gn|sup|yo|lol|haha|😂|💀)\s*[!.]*$/i.test(t))
-    return 'chat'
+  // Chat
+  if (/^(hey|hi|hello|thanks|thank you|ok|okay|good morning|gm|gn|sup|yo|lol|haha|😂|💀)\s*[!.]*$/i.test(t)) return 'chat'
 
-  // Store — anything substantial without a question mark is probably a memory
+  // Store — substantial text without a question mark
   if (t.length > 20 && !t.includes('?')) return 'store'
 
   return null
 }
 
-/**
- * LLM fallback for genuinely ambiguous messages (~30% of cases).
- */
 async function llmClassify(text: string, context: ConversationContext): Promise<Intent> {
   const messages = context.toClaudeMessages()
   messages.push({ role: 'user', content: text })
@@ -89,36 +87,34 @@ async function llmClassify(text: string, context: ConversationContext): Promise<
     client.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 20,
-      system: `Classify the user's message. Reply with ONLY one word from this list: store, recall, reflect, chat, remind, calendar, search, forget, stats, export
+      system: `Classify the user's message intent. Reply with ONLY one word.
 
-- store: sharing something that happened, a thought, feeling, update, or observation
-- recall: asking about something from the past, "what did I say about...", memory search
-- reflect: wanting a weekly/monthly summary, patterns, how they've been doing
-- chat: greeting, small talk, banter, casual conversation
-- remind: setting a reminder for a future time
-- calendar: asking about their schedule, events, meetings
-- search: wanting to search the web, find jobs/opportunities/info
-- forget: wants to delete/remove the last memory
-- stats: wants to see their memory count or statistics
-- export: wants to download/export all their memories`,
+store    — sharing something that happened, a thought, feeling, or update
+recall   — asking about something from the past or searching memory
+reflect  — wanting a weekly/monthly summary or patterns
+chat     — greeting, small talk, banter
+remind   — setting a future reminder
+calendar — asking about schedule or events
+search   — searching the web for info or jobs
+research — deep research dive on a topic (multi-source)
+forget   — wants to delete the last memory
+stats    — wants memory count or statistics
+export   — wants to download all memories
+people   — asking about a specific person ("who is X", "tell me about X")
+habits   — asking about habit streaks or tracking
+link     — message contains a URL`,
       messages,
     })
   )
 
-  const word =
-    response.content.find((b) => b.type === 'text')?.type === 'text'
-      ? (response.content.find((b) => b.type === 'text') as { type: 'text'; text: string }).text
-          .trim()
-          .toLowerCase()
-      : 'store'
+  const word = response.content.find((b) => b.type === 'text')?.type === 'text'
+    ? (response.content.find((b) => b.type === 'text') as { type: 'text'; text: string }).text.trim().toLowerCase()
+    : 'store'
 
-  const valid: Intent[] = ['store', 'recall', 'reflect', 'chat', 'remind', 'calendar', 'search', 'forget', 'stats', 'export']
+  const valid: Intent[] = ['store', 'recall', 'reflect', 'chat', 'remind', 'calendar', 'search', 'research', 'forget', 'stats', 'export', 'people', 'habits', 'link']
   return valid.includes(word as Intent) ? (word as Intent) : 'store'
 }
 
-/**
- * Main message handler — routes each message to the right handler.
- */
 export async function handleMessage(
   text: string,
   sender: string,
@@ -127,11 +123,18 @@ export async function handleMessage(
 ): Promise<string> {
   if (!text || text.trim().length === 0) return '👍'
 
+  // Link detection is deterministic — handle before classification
+  const urls = extractUrls(text)
+  if (urls.length > 0) {
+    const result = await summarizeLink(urls[0]!, text, sender, context)
+    // Store the summary as a memory via normal store flow
+    await storeMemory(result.memoryText, sender, context)
+    return result.reply
+  }
+
   const intent = localClassify(text) ?? (await llmClassify(text, context))
 
-  if (config.debug) {
-    console.log(`[Router] "${text.slice(0, 60)}..." → ${intent}`)
-  }
+  if (config.debug) console.log(`[Router] "${text.slice(0, 60)}..." → ${intent}`)
 
   switch (intent) {
     case 'store':
@@ -155,6 +158,18 @@ export async function handleMessage(
     case 'search':
       return webSearch(text, sender, context)
 
+    case 'research': {
+      // Strip the trigger word to get the actual topic
+      const topic = text.replace(/^(research|deep dive|research mode|deep research|investigate|look into)\s*:?\s*/i, '').trim()
+      const result = await researchTopic(topic, sender, context, async () => {
+        await sdk.send(sender, 'on it, digging in... 🔍')
+      })
+      if (result.filePath) {
+        try { await sdk.send(sender, { files: [result.filePath] }) } catch { /* ignore file send failure */ }
+      }
+      return result.summary
+    }
+
     case 'forget':
       return forgetLast(sender)
 
@@ -164,15 +179,27 @@ export async function handleMessage(
     case 'export': {
       const result = await exportMemories(sender)
       if ('filePath' in result) {
-        // Send the file back as an attachment
-        try {
-          await sdk.send(sender, { files: [result.filePath] })
-          return result.reply
-        } catch {
-          return result.reply + ' (file send failed — try again)'
-        }
+        try { await sdk.send(sender, { files: [result.filePath] }) } catch { /* ignore */ }
+        return result.reply
       }
       return result.reply
+    }
+
+    case 'people':
+      return getPeopleProfile(text, sender)
+
+    case 'habits':
+      return getHabitsOverview(sender)
+
+    case 'link': {
+      // Already handled above but router might land here via LLM classify
+      const urlsAgain = extractUrls(text)
+      if (urlsAgain.length > 0) {
+        const result = await summarizeLink(urlsAgain[0]!, text, sender, context)
+        await storeMemory(result.memoryText, sender, context)
+        return result.reply
+      }
+      return storeMemory(text, sender, context)
     }
   }
 }
