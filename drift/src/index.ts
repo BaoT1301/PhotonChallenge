@@ -35,6 +35,9 @@ you can also:
 • "stats" — see your memory count
 • send a photo — i'll analyze it
 • send a voice memo — i'll transcribe it
+• "coffee shops near [place]" — find spots nearby
+• "directions to [place]" — step-by-step routing
+• "my home is [address]" — save your location
 
 let's go — what's on your mind?`
 
@@ -71,6 +74,7 @@ async function main() {
   console.log(`   Calendar: ${config.calendarEnabled ? '✓ connected' : '✗ not configured'}`)
   console.log(`   Search:   ${config.searchEnabled ? '✓ enabled' : '✗ no API key'}`)
   console.log(`   Voice:    ${config.voiceEnabled ? '✓ enabled' : '✗ no OpenAI key'}`)
+  console.log(`   Maps:     ${config.mapsEnabled ? '✓ enabled' : '✗ no Google Maps key'}`)
   console.log(`   Debounce: ${config.debounceMs > 0 ? `${config.debounceMs / 1000}s` : 'disabled'}`)
   console.log(`   Debug:    ${config.debug}`)
   console.log()

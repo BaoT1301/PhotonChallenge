@@ -14,6 +14,7 @@ import { researchTopic } from './handlers/research.js'
 import { getPeopleProfile } from './handlers/people.js'
 import { getHabitsOverview } from './handlers/habits.js'
 import { extractUrls, summarizeLink } from './handlers/link.js'
+import { mapsQuery } from './handlers/maps.js'
 import { withRetry } from './retry.js'
 import { config } from './config.js'
 
@@ -23,7 +24,7 @@ type Intent =
   | 'store' | 'recall' | 'reflect' | 'chat'
   | 'remind' | 'calendar' | 'search' | 'research'
   | 'forget' | 'stats' | 'export'
-  | 'people' | 'habits' | 'link'
+  | 'people' | 'habits' | 'link' | 'maps'
 
 function localClassify(text: string): Intent | null {
   const t = text.toLowerCase().trim()
@@ -67,6 +68,13 @@ function localClassify(text: string): Intent | null {
   if (/^(weekly|summary|reflect|review|digest|wrap.?up|look back|my week)\b/.test(t)) return 'reflect'
   if (/\b(how.*(my|this).*(week|month)|pattern|trend|overview|vibe check)\b/.test(t)) return 'reflect'
 
+  // Maps — location recommendations and directions (check before generic search)
+  if (/\b(near me|nearby|around here|around me|in my area)\b/.test(t)) return 'maps'
+  if (/\b(directions? to|how (do i|do we|should i) get (to|from)|which way (to|should)|navigate to|take me to)\b/.test(t)) return 'maps'
+  if (/\b(how (far|long) (is it|to drive|to walk|to get) (to|from))\b/.test(t)) return 'maps'
+  if (/\b(restaurants?|coffee shops?|cafes?|gyms?|bars?|hotels?|gas stations?|pharmacies?|grocery|parks?)\b/.test(t) && /\b(near|in|around|close to)\b/.test(t)) return 'maps'
+  if (/\b(my home is( at)?|i live at|my office is( at)?|i work at|save my (home|work|location))\b/.test(t)) return 'maps'
+
   // Search — explicit
   if (/\b(search|find me|look up|google|jobs?|internships?|opportunities?|companies?)\b/.test(t)) return 'search'
 
@@ -102,7 +110,8 @@ stats    — wants memory count or statistics
 export   — wants to download all memories
 people   — asking about a specific person ("who is X", "tell me about X")
 habits   — asking about habit streaks or tracking
-link     — message contains a URL`,
+link     — message contains a URL
+maps     — asking for place recommendations near a location, or asking for directions/navigation`,
       messages,
     })
   )
@@ -111,7 +120,7 @@ link     — message contains a URL`,
     ? (response.content.find((b) => b.type === 'text') as { type: 'text'; text: string }).text.trim().toLowerCase()
     : 'store'
 
-  const valid: Intent[] = ['store', 'recall', 'reflect', 'chat', 'remind', 'calendar', 'search', 'research', 'forget', 'stats', 'export', 'people', 'habits', 'link']
+  const valid: Intent[] = ['store', 'recall', 'reflect', 'chat', 'remind', 'calendar', 'search', 'research', 'forget', 'stats', 'export', 'people', 'habits', 'link', 'maps']
   return valid.includes(word as Intent) ? (word as Intent) : 'store'
 }
 
@@ -201,5 +210,8 @@ export async function handleMessage(
       }
       return storeMemory(text, sender, context)
     }
+
+    case 'maps':
+      return mapsQuery(text, sender, context)
   }
 }

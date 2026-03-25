@@ -39,6 +39,9 @@ export const config = {
   // OpenAI — optional, used for Whisper voice transcription
   openaiApiKey: optionalEnv('OPENAI_API_KEY'),
 
+  // Google Maps — optional
+  googleMapsApiKey: optionalEnv('GOOGLE_MAPS_API_KEY'),
+
   // Google Calendar — optional
   google: {
     clientId: optionalEnv('GOOGLE_CLIENT_ID'),
@@ -57,5 +60,9 @@ export const config = {
 
   get voiceEnabled(): boolean {
     return !!this.openaiApiKey
+  },
+
+  get mapsEnabled(): boolean {
+    return !!this.googleMapsApiKey
   },
 } as const
